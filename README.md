@@ -60,6 +60,10 @@ It runs entirely locally. No server to deploy, no auth, no remote access — the
 | **Light / dark theme** | Follows the system by default, with a persistent manual light/dark/system toggle. |
 | **Interface language** | Follows the system by default, with Simplified Chinese and English overrides. The compact language menu applies immediately, persists in `localStorage`, and updates the document language. |
 
+## CLI compatibility
+
+Current CLI structured completion events preserve command output, exit codes, and file changes during replay, while older command logs remain supported. Added/deleted file content is converted to unified diffs with accurate change types and line counts. History lists read recent sessions on demand and cache unchanged metadata/previews; compressed preview reads close their input streams before decoding the rest of the archive.
+
 ## Prerequisites
 
 - **Node.js 18.18+** (Next.js 15 requirement)

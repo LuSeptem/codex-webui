@@ -203,6 +203,14 @@ Theme and interface language both default to following the operating system when
 
 For rich hover details, use one tooltip implementation per trigger. Do not combine a native `title` attribute with a custom `role="tooltip"` surface: browsers will display both. The context-usage trigger is keyboard-focusable and exposes only the custom tooltip through `aria-describedby`.
 
+## CLI compatibility and history I/O
+
+- Both live app-server file changes and persisted FileChange maps use lib/codex/file-change.ts. It accepts structured or legacy string kinds, preserves update diffs and move paths, and turns add/delete file content into unified diffs.
+- Replay consumes event_msg/item_completed CommandExecution and FileChange records. Command completions preserve output, status and exit codes. Older shell_command/exec_command text is a deferred fallback, discarded when a matching structured command completes; replay never evaluates stored JavaScript.
+- Session listing sorts filesystem metadata before reading records, processes small batches until the requested number of filtered results is found, and caches heads/previews by path, size and mtime. Titles are reloaded from the session index so renames do not require touching the rollout. Preview reads stop at the first real user prompt.
+- Compressed readers use a pipeline so early close, backpressure and decoder errors reach the source stream. Do not leave the compressed input reading after a head/preview consumer stops.
+- Run npm test for structured/legacy replay, live and replay file diffs, bounded history I/O, cache invalidation, filters/title refresh, and compressed stream lifecycle. Test fixtures stay under ignored .tmp/compat-tests; no user history is copied into the tests.
+
 ## Environment variables
 
 | Variable | Default | Purpose |

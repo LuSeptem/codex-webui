@@ -34,9 +34,13 @@ export function parseDiff(patch: string, path: string): DiffFile {
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    if (line === "\\ No newline at end of file") {
+      result.push({ type: "meta", content: line });
+      continue;
+    }
 
     // apply_patch 头部：*** /path 或 +++ /path
-    if (line.startsWith("*** ") || line.startsWith("--- ")) {
+    if (line.startsWith("*** ") || line.startsWith("--- ") || line.startsWith("+++ ")) {
       result.push({ type: "meta", content: line });
       continue;
     }
