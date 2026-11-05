@@ -6,7 +6,7 @@
  * - 读取前 N 行找首条用户消息作 preview
  * - 结合文件名时间戳与 mtime 组装 ThreadItem
  *
- * 支持 cwd 过滤、关键词搜索；上限 10000 文件。
+ * 按修改时间排序，按需读取并缓存元数据和预览；支持 cwd 与关键词过滤。
  */
 
 import { readdirSync, statSync } from "node:fs";
@@ -19,7 +19,6 @@ import {
   isCompressed,
   parseSessionIdFromFilename,
   parseTimestampFromFilename,
-  fileMtime,
 } from "./paths";
 import { readFirstLine, readLinesUntil } from "./reader";
 import type { RolloutLine } from "./types";
@@ -34,111 +33,90 @@ export interface ListOptions {
   limit?: number;
 }
 
-/** 列出所有会话（按更新时间降序） */
+interface RolloutFile {
+  path: string;
+  id: string;
+  mtimeMs: number;
+  size: number;
+}
+interface CachedHead {
+  meta: SessionMeta;
+  preview?: Promise<string | null>;
+}
+const headCache = new Map<string, { stamp: string; value: Promise<CachedHead | null> }>();
+
+/** Sort file metadata first; open only as many matching sessions as requested. */
 export async function listSessions(opts: ListOptions = {}): Promise<ThreadItem[]> {
-  const roots = [sessionsRoot(), archivedSessionsRoot()];
-  const files: string[] = [];
-
-  for (const root of roots) {
-    try {
-      walkDir(root, files);
-    } catch {
-      // 目录不存在或无权限，跳过
-    }
-    if (files.length > 10000) break;
-  }
-
-  // 预加载 session_index.jsonl（session_id → thread_name）
-  const indexMap = await loadSessionIndex();
-
+  const limit = Number.isFinite(opts.limit) ? Math.max(0, Math.min(10000, Math.floor(opts.limit!))) : 200;
+  if (!limit) return [];
+  const files = new Map<string, RolloutFile>();
+  for (const root of [sessionsRoot(), archivedSessionsRoot()]) walkDir(root, files);
+  const candidates = [...files.values()].sort((a, b) => b.mtimeMs - a.mtimeMs || a.path.localeCompare(b.path));
+  const present = new Set(candidates.map((file) => file.path));
+  for (const key of headCache.keys()) if (!present.has(key)) headCache.delete(key);
+  const index = await loadSessionIndex();
   const items: ThreadItem[] = [];
-  for (const file of files) {
-    const item = await buildThreadItem(file, indexMap);
-    if (item) items.push(item);
+  // A small batch shares filesystem latency without opening every archive.
+  for (let offset = 0; offset < candidates.length && items.length < limit; offset += 8) {
+    const batch = await Promise.all(candidates.slice(offset, offset + 8)
+      .map((file) => buildThreadItem(file, index, opts)));
+    items.push(...batch.filter((item): item is ThreadItem => item !== null));
   }
-
-  // 排序：updatedAt 降序
-  items.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-
-  // 过滤
-  let filtered = items;
-  if (opts.cwd) {
-    const cwdNorm = path.resolve(opts.cwd).toLowerCase();
-    filtered = filtered.filter((it) => it.cwd.toLowerCase() === cwdNorm);
-  }
-  if (opts.q) {
-    const q = opts.q.toLowerCase();
-    filtered = filtered.filter(
-      (it) => it.preview.toLowerCase().includes(q) || it.cwd.toLowerCase().includes(q),
-    );
-  }
-
-  const limit = opts.limit ?? 200;
-  return filtered.slice(0, limit);
+  return items.slice(0, limit);
 }
 
-/** 递归收集 rollout 文件 */
-function walkDir(dir: string, out: string[]): void {
-  let entries: string[];
-  try {
-    entries = readdirSync(dir);
-  } catch {
-    return;
-  }
+function walkDir(dir: string, files: Map<string, RolloutFile>): void {
+  let entries;
+  try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
   for (const entry of entries) {
-    const full = path.join(dir, entry);
-    let st;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) { walkDir(full, files); continue; }
+    if (!entry.isFile() || !isRolloutFile(entry.name)) continue;
+    const id = parseSessionIdFromFilename(entry.name);
+    if (!id) continue;
+    const existing = files.get(id);
+    if (existing && (!isCompressed(existing.path) || isCompressed(full))) continue;
     try {
-      st = statSync(full);
-    } catch {
-      continue;
-    }
-    if (st.isDirectory()) {
-      walkDir(full, out);
-    } else if (isRolloutFile(entry)) {
-      out.push(full);
-    }
+      const stat = statSync(full);
+      files.set(id, { path: full, id, mtimeMs: stat.mtimeMs, size: stat.size });
+    } catch { /* file may have moved during the scan */ }
   }
 }
 
-/** 从单个 rollout 文件构建 ThreadItem */
 async function buildThreadItem(
-  filePath: string,
-  indexMap?: Map<string, string>,
+  file: RolloutFile,
+  index: Map<string, string>,
+  opts: ListOptions,
 ): Promise<ThreadItem | null> {
-  const name = path.basename(filePath);
-  const sessionId = parseSessionIdFromFilename(name);
-  if (!sessionId) return null;
-
-  // 读取首行 meta
-  const firstLine = await readFirstLine(filePath);
-  if (!firstLine || firstLine.type !== "session_meta") return null;
-
-  const meta = firstLine.payload as SessionMeta;
-
-  // 过滤子代理会话（guardian / thread_spawn 等），这些不是用户发起的正常对话
-  if (isSubagentSource(meta.source)) return null;
-
-  // 标题优先级：session_index.jsonl 的 thread_name > 首条用户消息 preview
-  const threadName = indexMap?.get(sessionId);
-  const preview = threadName ?? (await extractPreview(filePath)) ?? "(empty session)";
-
-  const filenameTs = parseTimestampFromFilename(name);
-  const createdAt = meta.timestamp || filenameTs || fileMtime(filePath);
-  const updatedAt = fileMtime(filePath);
-
+  const stamp = file.mtimeMs + ":" + file.size;
+  let cached = headCache.get(file.path);
+  if (!cached || cached.stamp !== stamp) {
+    const value = readFirstLine(file.path).then((line): CachedHead | null =>
+      line?.type === "session_meta" ? { meta: line.payload as SessionMeta } : null).catch(() => null);
+    cached = { stamp, value };
+    headCache.set(file.path, cached);
+  }
+  const head = await cached.value;
+  if (!head || isSubagentSource(head.meta.source)) return null;
+  const meta = head.meta;
+  const cwd = meta.cwd || "";
+  if (opts.cwd && cwd.toLowerCase() !== path.resolve(opts.cwd).toLowerCase()) return null;
+  const indexedTitle = index.get(file.id);
+  if (!indexedTitle) head.preview ??= extractPreview(file.path).catch(() => null);
+  const preview = indexedTitle ?? (await head.preview) ?? "(empty session)";
+  const q = opts.q?.toLowerCase();
+  if (q && !preview.toLowerCase().includes(q) && !cwd.toLowerCase().includes(q)) return null;
+  const updatedAt = new Date(file.mtimeMs).toISOString();
   return {
-    id: sessionId,
-    preview,
-    cwd: meta.cwd || "",
-    createdAt,
+    id: file.id, preview, cwd,
+    createdAt: meta.timestamp || parseTimestampFromFilename(path.basename(file.path)) || updatedAt,
     updatedAt,
     source: typeof meta.source === "string" ? meta.source : undefined,
     cliVersion: meta.cli_version,
     modelProvider: meta.model_provider,
     gitBranch: meta.git_branch,
-    path: filePath,
-    compressed: isCompressed(name),
+    path: file.path,
+    compressed: isCompressed(file.path),
   };
 }
 
@@ -211,8 +189,15 @@ function extractTitleFromInjection(text: string): string | null {
 
 /** 提取首条真实用户消息作为预览文本（跳过 AGENTS.md / recommended_plugins 等系统注入） */
 async function extractPreview(filePath: string): Promise<string | null> {
-  // 收集前 N 行中的所有用户消息，再从中筛选第一条非系统注入的
-  const lines = await readLinesUntil(filePath, () => false, 150);
+  // Stop at the first real prompt instead of decoding another 150 lines.
+  const lines = await readLinesUntil(filePath, (line) => {
+    const p = line.payload as { type?: string; role?: string; message?: string; text?: string; content?: Array<{ text?: string }> };
+    const text = line.type === "event_msg" && p.type === "user_message"
+      ? p.message || p.text || ""
+      : line.type === "response_item" && p.type === "message" && p.role === "user"
+        ? p.content?.map((part) => part.text || "").join("\n") || "" : "";
+    return !!text && !isSystemInjection(text);
+  }, 150);
 
   const userTexts: string[] = [];
   for (const line of lines) {

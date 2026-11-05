@@ -1,3 +1,4 @@
+import { mapFileChanges } from "./file-change";
 import type {
   ItemCompletedEvent,
   ResponseItem,
@@ -68,17 +69,7 @@ export function mapAppServerItem(item: UnknownItem): ResponseItem[] {
         status: item.status === "completed" ? "completed" : "in_progress",
       }];
     case "fileChange":
-      return (Array.isArray(item.changes) ? item.changes : []).map((raw, index) => {
-        const change = raw as Record<string, unknown>;
-        const kind = String(change.kind ?? "update");
-        return {
-          id: `${id}:${index}`,
-          type: "file_change" as const,
-          change: kind === "add" ? "create" as const : kind === "delete" ? "delete" as const : "edit" as const,
-          path: String(change.path ?? ""),
-          patch: typeof change.diff === "string" ? change.diff : undefined,
-        };
-      });
+      return mapFileChanges(id, item.changes);
     case "mcpToolCall":
       return [{
         id,

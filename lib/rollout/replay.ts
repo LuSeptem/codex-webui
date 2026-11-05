@@ -1,3 +1,5 @@
+import { fileURLToPath } from "node:url";
+import { mapFileChanges } from "@/lib/codex/file-change";
 /**
  * rollout 文件回放：转换为与 exec 事件流一致的 SSE 事件。
  *
@@ -18,7 +20,7 @@
  * item.completed / usage.updated / error，实时与回放完全统一。
  */
 
-import type { ResponseItem, Usage, AgentMessageItem, UserMessageItem, ReasoningItem, SessionMeta, FileChangeItem, CommandExecutionItem } from "@/types/api";
+import type { ResponseItem, Usage, AgentMessageItem, UserMessageItem, ReasoningItem, SessionMeta, CommandExecutionItem } from "@/types/api";
 import { readRolloutLines } from "./reader";
 import type { RolloutLine, ReplayEvent, EventMsgLine, ResponseItemLine } from "./types";
 import { extractReasoningSummaryText } from "@/lib/utils/format";
@@ -69,9 +71,32 @@ export async function* replayRollout(
   // 用 Set 跟踪已显示的推理文本，避免同一推理显示两次。
   const seenReasoningTexts = new Set<string>();
 
+  // Legacy records lack structured completion events; defer their command fallback
+  // until the next message so a matching completion can supply output and status.
+  const pendingCommands: ReplayEvent[] = [];
   for await (const line of readRolloutLines(filePath)) {
     if (signal?.aborted) return;
 
+    const payload = line.payload as Record<string, unknown>;
+    if (line.type === "response_item" && payload.type === "custom_tool_call") {
+      const fallback = mapCustomToolCall(payload as Parameters<typeof mapCustomToolCall>[0], genId, line.timestamp);
+      if (fallback) pendingCommands.push(fallback);
+      continue;
+    }
+    if (line.type === "event_msg" && payload.type === "item_completed") {
+      const item = payload.item as Record<string, unknown> | undefined;
+      if (item?.type === "CommandExecution") {
+        const commands = [
+          ...(Array.isArray(item.parsed_cmd) ? item.parsed_cmd.map((value) => (value as { cmd?: unknown }).cmd) : []),
+          ...(Array.isArray(item.command) ? item.command : [item.command]),
+        ];
+        for (let i = pendingCommands.length - 1; i >= 0; i--) {
+          const fallback = pendingCommands[i];
+          if (fallback.type === "item.completed" && fallback.item.type === "command_execution"
+            && commands.includes(fallback.item.command)) pendingCommands.splice(i, 1);
+        }
+      }
+    }
     const events = mapLineToEvents(line, genId, {
       getUsage: () => pendingUsage,
       setUsage: (u) => {
@@ -105,6 +130,11 @@ export async function* replayRollout(
 
     // 对 message 类型的 item.completed 做去重
     for (const event of events) {
+      if (event.type === "turn.completed" ||
+        (event.type === "item.completed" && event.item.type === "agent_message")) {
+        yield* pendingCommands;
+        pendingCommands.length = 0;
+      }
       if (event.type === "item.completed") {
         const item = event.item;
         if (item.type === "agent_message" || item.type === "user_message") {
@@ -117,6 +147,7 @@ export async function* replayRollout(
       yield event;
     }
   }
+  yield* pendingCommands;
 }
 
 /** 回放上下文：缓存读写回调 */
@@ -176,6 +207,35 @@ function mapEventMsg(
   const events: ReplayEvent[] = [];
 
   switch (p.type) {
+    case "item_completed": {
+      const item = p.item as Record<string, unknown> | undefined;
+      if (item?.type === "CommandExecution") {
+        let cwd = typeof item.cwd === "string" ? item.cwd : undefined;
+        if (cwd?.startsWith("file:")) {
+          try { cwd = fileURLToPath(cwd); } catch { /* retain the original URI */ }
+        }
+        const command = Array.isArray(item.command)
+          ? item.command.map((arg) => /[\s"]/.test(String(arg)) ? JSON.stringify(arg) : String(arg)).join(" ")
+          : String(item.command ?? "");
+        events.push({
+          type: "item.completed", timestamp: lineTimestamp,
+          item: {
+            id: typeof item.id === "string" ? item.id : genId(),
+            type: "command_execution", command, cwd,
+            aggregated_output: typeof item.aggregated_output === "string" ? item.aggregated_output : undefined,
+            stdout: typeof item.stdout === "string" ? item.stdout : undefined,
+            stderr: typeof item.stderr === "string" ? item.stderr : undefined,
+            exit_code: typeof item.exit_code === "number" ? item.exit_code : null,
+            status: item.status === "completed" ? "completed" : "in_progress",
+          },
+        });
+      } else if (item?.type === "FileChange") {
+        for (const change of mapFileChanges(typeof item.id === "string" ? item.id : genId(), item.changes)) {
+          events.push({ type: "item.completed", item: change, timestamp: lineTimestamp });
+        }
+      }
+      break;
+    }
     case "task_started": {
       const startedAt = typeof p.started_at === "number" ? p.started_at : undefined;
       ctx.setStartedAt(startedAt);
@@ -260,32 +320,8 @@ function mapEventMsg(
     }
 
     case "patch_apply_end": {
-      // 文件补丁应用完成：codex 通过 custom_tool_call(name=exec) 调用 apply_patch
-      // 后触发此事件。payload.changes 是 {filePath: {type, content}} 映射。
-      // 映射为 file_change items，使 FileChangeCard 能渲染文件创建/编辑超链接。
-      const changes = p.changes as Record<string, { type?: string; content?: string }> | undefined;
-      if (changes) {
-        for (const [filePath, info] of Object.entries(changes)) {
-          const rawChangeType = info?.type;
-          const change: FileChangeItem["change"] =
-            rawChangeType === "add" ? "create" :
-            rawChangeType === "delete" ? "delete" :
-            rawChangeType === "rename" ? "rename" : "edit";
-          // 为 "add" 构造 unified diff patch，使 FileChangeCard 可点击查看 diff
-          let patch: string | undefined;
-          if (rawChangeType === "add" && info?.content) {
-            const lines = info.content.split("\n");
-            patch = `*** Begin Patch\n*** Add File: ${filePath}\n${lines.map((l) => "+" + l).join("\n")}\n*** End Patch`;
-          }
-          const fcItem: FileChangeItem = {
-            id: genId(),
-            type: "file_change",
-            change,
-            path: filePath,
-            patch,
-          };
-          events.push({ type: "item.completed", item: fcItem, timestamp: lineTimestamp });
-        }
+      for (const item of mapFileChanges(genId(), p.changes)) {
+        events.push({ type: "item.completed", item, timestamp: lineTimestamp });
       }
       break;
     }
@@ -408,10 +444,8 @@ function mapResponseItem(
     ctx.addReasoningText(it.text);
   }
 
-  // custom_tool_call：codex 新版的工具调用格式（替代旧的 function_call）。
-  // name=exec + tools.shell_command → 映射为 command_execution（显示 shell 命令）
-  // name=exec + tools.apply_patch   → 跳过（patch_apply_end 事件会产生 file_change）
-  // 其他 name → 跳过
+  // Fallback for older logs; current logs use event_msg/item_completed
+  // for command output/status and file changes.
   if (rawType === "custom_tool_call") {
     return mapCustomToolCall(item as ResponseItem & { name?: string; input?: string }, genId, lineTimestamp);
   }
@@ -427,15 +461,11 @@ function mapResponseItem(
 /**
  * 将 custom_tool_call 映射为 command_execution（shell 命令）或跳过。
  *
- * codex 新版用 custom_tool_call(name=exec) 替代旧的 function_call。input 字段是
- * JavaScript 代码字符串，包含 tools.shell_command({command:"..."}) 或 tools.apply_patch。
- *
- * - tools.shell_command → 提取 command 参数，映射为 command_execution item
- * - tools.apply_patch   → 跳过（patch_apply_end 事件会产生 file_change items）
- * - 其他                → 跳过
+ * Legacy code-mode fallback: recognize shell_command/exec_command text without
+ * evaluating JavaScript. Structured completion events take precedence.
  */
 function mapCustomToolCall(
-  item: ResponseItem & { name?: string; input?: string },
+  item: { id?: string; name?: string; input?: string },
   genId: () => string,
   lineTimestamp?: string,
 ): ReplayEvent | null {
@@ -470,7 +500,7 @@ function mapCustomToolCall(
  * 用正则匹配 command:"..." 部分，再用 JSON.parse 反转义 JavaScript 字符串转义。
  */
 function extractShellCommand(input: string): string | null {
-  const match = input.match(/tools\.shell_command\(\{command:"((?:[^"\\]|\\.)*)"/);
+  const match = input.match(/tools\.(?:shell_command|exec_command)\(\s*\{\s*(?:command|cmd)\s*:\s*"((?:[^"\\]|\\.)*)"/);
   if (!match) return null;
   try {
     return JSON.parse('"' + match[1] + '"');

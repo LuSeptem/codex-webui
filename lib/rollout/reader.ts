@@ -10,7 +10,7 @@
 
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
-import { Readable } from "node:stream";
+import { Transform, pipeline } from "node:stream";
 import { Decompress } from "fzstd";
 import type { RolloutLine } from "./types";
 import { isCompressed } from "./paths";
@@ -138,31 +138,22 @@ export async function readLinesUntil(
  */
 function createZstdDecompressStream(filePath: string): NodeJS.ReadableStream {
   const decoder = new Decompress();
-
-  const out = new Readable({
-    read() {
-      /* 数据通过 push 注入 */
+  const out = new Transform({
+    transform(chunk, _encoding, callback) {
+      try {
+        decoder.push(new Uint8Array(chunk));
+        callback();
+      } catch (error) { callback(error as Error); }
+    },
+    flush(callback) {
+      try {
+        decoder.push(new Uint8Array(0), true);
+        callback();
+      } catch (error) { callback(error as Error); }
     },
   });
-
-  decoder.ondata = (data: Uint8Array, final?: boolean) => {
-    out.push(Buffer.from(data));
-    if (final) {
-      out.push(null);
-    }
-  };
-
-  const rawStream = createReadStream(filePath);
-  rawStream.on("data", (chunk) => {
-    decoder.push(new Uint8Array(chunk as Buffer));
-  });
-  rawStream.on("end", () => {
-    // 通知 decoder 输入结束
-    decoder.push(new Uint8Array(0), true);
-  });
-  rawStream.on("error", (err) => {
-    out.destroy(err);
-  });
-
+  decoder.ondata = (data: Uint8Array) => { out.push(Buffer.from(data)); };
+  // pipeline propagates early close/errors to the archive's input stream.
+  pipeline(createReadStream(filePath, { highWaterMark: 16 * 1024 }), out, () => {});
   return out;
 }
